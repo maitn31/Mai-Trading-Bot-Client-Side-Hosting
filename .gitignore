@@ -1,0 +1,13 @@
+.env
+*.env
+*.session
+*.txt
+*.json
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+.venv/
+
+!/requirements.txt
