@@ -1,10 +1,12 @@
+import json
 import os
 import re
+import sys
+
 import requests
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
 from telethon import TelegramClient, events
-import sys
 
 
 def get_app_folder():
@@ -12,30 +14,76 @@ def get_app_folder():
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
-APP_FOLDER = get_app_folder()
 
+APP_FOLDER = get_app_folder()
 load_dotenv(os.path.join(APP_FOLDER, ".env"))
 
-
-
 FIREBASE_API_KEY = os.getenv("FIREBASE_API_KEY")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "").rstrip("/")
 CHANNEL_NAME = os.getenv("CHANNEL_NAME")
 
 TELEGRAM_API_ID = os.getenv("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-GOOGLE_CLIENT_FILE = os.path.join(APP_FOLDER, "google-oauth-client.json")
 
+GOOGLE_CLIENT_FILE = os.path.join(APP_FOLDER, "google-oauth-client.json")
+SESSION_FILE = os.path.join(APP_FOLDER, "firebase_session.json")
+TXT_BACKUP_FILE = os.path.join(APP_FOLDER, "valid_signals.txt")
 
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile"
 ]
+
 firebase_id_token = None
+firebase_refresh_token = None
 firebase_uid = None
 
 client = None
+
+
+def save_firebase_session(refresh_token):
+    with open(SESSION_FILE, "w", encoding="utf-8") as file:
+        json.dump({"refresh_token": refresh_token}, file)
+
+
+def load_firebase_session():
+    if not os.path.exists(SESSION_FILE):
+        return None
+
+    try:
+        with open(SESSION_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+            return data.get("refresh_token")
+    except Exception:
+        return None
+
+
+def refresh_firebase_login(refresh_token):
+    global firebase_id_token, firebase_refresh_token
+
+    url = f"https://securetoken.googleapis.com/v1/token?key={FIREBASE_API_KEY}"
+
+    payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+
+    response = requests.post(url, data=payload, timeout=20)
+    data = response.json()
+
+    if not response.ok:
+        print("Saved Firebase login expired or invalid.")
+        return False
+
+    firebase_id_token = data["id_token"]
+    firebase_refresh_token = data["refresh_token"]
+
+    save_firebase_session(firebase_refresh_token)
+
+    print("Firebase login restored/refreshed.")
+    return True
+
 
 def google_login():
     flow = InstalledAppFlow.from_client_secrets_file(
@@ -69,6 +117,36 @@ def firebase_login_with_google(google_id_token):
 
     return data
 
+
+def initialize_firebase_login():
+    global firebase_id_token, firebase_refresh_token, firebase_uid
+
+    saved_refresh_token = load_firebase_session()
+
+    if saved_refresh_token:
+        if refresh_firebase_login(saved_refresh_token):
+            firebase_uid = "restored_session"
+            return True
+
+    print("Opening Google login...")
+    google_id_token = google_login()
+
+    print("Logging in to Firebase...")
+    firebase_user = firebase_login_with_google(google_id_token)
+
+    firebase_id_token = firebase_user["idToken"]
+    firebase_refresh_token = firebase_user["refreshToken"]
+    firebase_uid = firebase_user["localId"]
+
+    save_firebase_session(firebase_refresh_token)
+
+    print("Firebase login successful")
+    print("UID:", firebase_uid)
+    print("Email:", firebase_user.get("email"))
+
+    return True
+
+
 def parse_signal_message(text):
     if not text:
         return None
@@ -95,6 +173,8 @@ def parse_signal_message(text):
 
 
 def save_signal_to_firebase(message_id, date, signal_data):
+    global firebase_id_token
+
     data = {
         "message_id": message_id,
         "pair": signal_data["pair"],
@@ -118,7 +198,17 @@ def save_signal_to_firebase(message_id, date, signal_data):
         return True
 
     if response.status_code in [401, 403]:
-        print("No Firebase write permission. Signal ignored:", message_id)
+        print("Firebase write failed. Trying to refresh token...")
+
+        if firebase_refresh_token and refresh_firebase_login(firebase_refresh_token):
+            url = f"{DATABASE_URL}/signals/{CHANNEL_NAME}/{message_id}.json?auth={firebase_id_token}"
+            response = requests.put(url, json=data, timeout=20)
+
+            if response.status_code == 200:
+                print("Saved to Firebase after token refresh:", message_id)
+                return True
+
+        print("No Firebase write permission or token refresh failed. Signal ignored:", message_id)
         print(response.text)
         return False
 
@@ -126,8 +216,9 @@ def save_signal_to_firebase(message_id, date, signal_data):
     print(response.text)
     return False
 
+
 def save_signal_to_txt(message_id, date, signal_data):
-    with open("valid_signals.txt", "a", encoding="utf-8") as file:
+    with open(TXT_BACKUP_FILE, "a", encoding="utf-8") as file:
         file.write(f"Message ID: {message_id}\n")
         file.write(f"Date: {date}\n")
         file.write(f"Pair: {signal_data['pair']}\n")
@@ -138,6 +229,7 @@ def save_signal_to_txt(message_id, date, signal_data):
         file.write(f"TP2: {signal_data['tp2']}\n")
         file.write(f"SL: {signal_data['sl']}\n")
         file.write("-" * 40 + "\n")
+
 
 @events.register(events.NewMessage(chats=CHANNEL_NAME))
 async def handle_new_message(event):
@@ -173,29 +265,24 @@ def check_env():
             print(f"{key} is missing in .env")
             return False
 
+    if not os.path.exists(GOOGLE_CLIENT_FILE):
+        print("google-oauth-client.json not found")
+        return False
+
     return True
 
+
 def main():
-    global firebase_id_token, firebase_uid, client
+    global client
 
     if not check_env():
         return
 
-    print("Opening Google login...")
-    google_id_token = google_login()
-
-    print("Logging in to Firebase...")
-    firebase_user = firebase_login_with_google(google_id_token)
-
-    firebase_id_token = firebase_user["idToken"]
-    firebase_uid = firebase_user["localId"]
-
-    print("Firebase login successful")
-    print("UID:", firebase_uid)
-    print("Email:", firebase_user.get("email"))
+    if not initialize_firebase_login():
+        return
 
     client = TelegramClient(
-        "client_telegram_session",
+        os.path.join(APP_FOLDER, "client_telegram_session"),
         int(TELEGRAM_API_ID),
         TELEGRAM_API_HASH
     )
