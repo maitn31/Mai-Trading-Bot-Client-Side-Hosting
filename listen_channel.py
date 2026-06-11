@@ -284,7 +284,10 @@ def main():
     client = TelegramClient(
         os.path.join(APP_FOLDER, "client_telegram_session"),
         int(TELEGRAM_API_ID),
-        TELEGRAM_API_HASH
+        TELEGRAM_API_HASH,
+        connection_retries=None,
+        retry_delay=5,
+        auto_reconnect=True
     )
 
     client.add_event_handler(handle_new_message)
